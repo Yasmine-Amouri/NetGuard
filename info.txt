@@ -1,0 +1,1819 @@
+1)
+An ADR isn't just a document saying "we chose Kafka." It records:
+- Context: What problem are we facing?
+- Decision drivers: What matters to us?
+- Alternatives: What could we choose?
+- Decision: What did we choose?
+- Consequences: What do we gain and what do we sacrifice?
+
+2)ADR-001 — What exactly is an event?
+Yes! In our example, an event is a piece of information representing something that happened at a particular time.
+
+For NetGuard, let's say a network link is monitored and produces these measurements:
+Timestamp	RTT	Jitter	Packet loss
+10:00:00	35 ms	2 ms	0%
+10:00:01	42 ms	3 ms	0%
+10:00:02	180 ms	25 ms	4%
+
+We could represent each row as an individual telemetry event.
+
+For example:
+{
+  "event_id": "evt-001",
+  "link_id": "link-01",
+  "timestamp": "2026-11-16T10:00:02Z",
+  "metrics": {
+    "rtt_ms": 180,
+    "jitter_ms": 25,
+    "packet_loss": 0.04
+  }
+}
+
+
+So, in our current design:
+- One event = one telemetry measurement for one network link at one point in time.
+- The collector generates or retrieves these measurements.
+- The collector publishes them to the next component.
+- The processor consumes them.
+Important distinction: generating an event doesn't necessarily mean sending it directly to the processor. It means creating the event. How it gets delivered depends on our communication architecture.
+
+Also, later we might publish other kinds of events, such as anomaly.detected or incident.created. So an event is a general concept, not just a measurement.
+
+3)1. What is telemetry?
+Telemetry is data collected from a system to monitor its behavior, performance or condition.
+
+In NetGuard, we're interested in network telemetry.
+
+For example:
+Metric	What it measures
+RTT	Round-trip time of network packets
+Jitter	Variation in packet delay
+Packet loss	Percentage of packets that fail to arrive
+Traffic	Amount of network data being transmitted
+
+4)But now you need to implement several things:
+- How does the processor claim an event so another processor doesn't process it simultaneously?
+- How do you handle a processor crash halfway through?
+- How do you retry failed events?
+- How do you prevent two processors from updating the same event?
+- How do you clean up old records?
+- How do you let multiple independent services consume the same event stream?
+These problems are solvable with PostgreSQL, but you're building a messaging system on top of a general-purpose database.
+
+
+One particularly useful Kafka feature is consumer groups.
+
+Imagine NetGuard eventually needs two independent services to consume the same telemetry:
+- A persistence worker stores measurements in PostgreSQL.
+- An ML worker analyzes measurements for anomalies.
+With Kafka, they can each have their own consumer group and independently read the same events.
+
+The persistence worker doesn't have to wait for the ML worker. They can progress independently.
+
+That's a major architectural advantage for NetGuard.
+
+One important caveat: Kafka doesn't magically guarantee that every event is processed exactly once by your entire application. Consumers can sometimes process an event again after a failure. That's why we'll later discuss at-least-once delivery and idempotency.
+
+Each group tracks its own progress. For example, the ML worker can be behind the persistence worker without preventing it from progressing.
+
+One subtlety: within a consumer group, Kafka distributes partitions among consumers. Independent consumer groups, however, each get their own view of the topic.
+
+This is called loose coupling: services don't need to know about each other to receive the same data.
+
+5)You're right that Kafka is more complex, but I want you to distinguish two statements:
+- "Kafka is a better approach than HTTP."
+- "Kafka is a better approach for our particular requirements."
+
+6)2. One architectural detail to understand before moving on
+There's an important concept hidden in this ADR: at-least-once delivery.
+
+Suppose:
+1. The ML worker reads event evt-001.
+2. It processes the event successfully.
+3. It crashes before committing its Kafka offset.
+4. It restarts and reads evt-001 again.
+The same event may be processed twice!
+
+That's why we need idempotency: processing the same event more than once should not produce duplicate or incorrect results.
+
+We'll explore this when implementing the consumers, not now.
+
+7)2. What is ingestion?
+Ingestion means bringing data into a system.
+
+Think of NetGuard as a factory:
+Data sources
+
+Historical dataset + Simulator
+
+Telemetry ingestion
+
+Collecting and receiving measurements
+
+Processing
+
+Validation, normalization, enrichment
+
+Storage + ML analysis
+
+
+So when we say telemetry ingestion, we mean receiving network measurements and introducing them into NetGuard's processing pipeline.
+
+8)Idempotency is a property of an operation: performing the same operation multiple times has the same final effect as performing it once.
+
+Example:
+
+Suppose Kafka delivers this event twice:
+evt-001: RTT = 120 ms
+
+
+Without idempotency:
+Database:
+evt-001
+evt-001
+
+
+With idempotency:
+Database:
+evt-001
+
+9)Remember this distinction:
+- At-least-once: events may arrive more than once.
+- Idempotency: duplicate processing doesn't create duplicate effects.
+
+10)1. Why not use only synthetic data?
+You said:
+We want to be able to detect real anomalies.
+
+Exactly.
+
+Imagine we build a simulator that generates data like this:
+Scenario	RTT	Packet loss
+Normal	30 ms	0%
+Anomaly	500 ms	40%
+
+We train our ML model on thousands of these generated measurements.
+
+The model might learn that:
+- RTT above 400 ms is abnormal.
+- Packet loss above 30% is abnormal.
+But real networks are more complicated. Our simulator might not reproduce their actual behavior.
+
+For example, real network degradation could involve:
+- RTT increasing gradually.
+- Jitter increasing while packet loss remains low.
+- Traffic increasing before latency starts rising.
+- Different behaviors depending on the network link.
+The danger is that our model learns the patterns of our simulator, rather than the patterns of real networks.
+
+This is called a generalization problem.
+
+That's why historical data is valuable: it gives us observations of real network behavior.
+
+11)So the same measurement can have different meanings depending on context.
+
+There are several dimensions to consider:
+- Magnitude: How large is the measurement?
+- Baseline: What is normal for this particular network?
+- Duration: Is it a temporary spike or a persistent problem?
+- Correlation: Are RTT, jitter and packet loss changing together?
+For example, an RTT of 150 ms might be perfectly normal for one connection but abnormal for another.
+
+This is why anomaly detection is interesting: we want to identify unusual behavior, not simply apply fixed thresholds.
+
+12)This is called a sim-to-real gap: the difference between the behavior represented by our simulated data and actual real-world behavior.
+What can we legitimately claim?
+Experiment	What it demonstrates
+Train and test on synthetic data	The model can recognize patterns in our simulator
+Train on historical + synthetic, test on unseen historical data	The model generalizes to some unseen real observations
+Test on real-world data from different conditions	Stronger evidence of real-world generalization
+
+Even the last one doesn't guarantee detection of every possible failure.
+
+13)Modularity = separation of responsibilities in the code.
+Distribution = separation of execution across processes or machines.
+
+14)2. Why not create dozens of microservices?
+You said overengineering. Let's identify its practical consequences:
+- Deployment complexity: more services to build, configure and deploy.
+- Monitoring complexity: more logs, metrics and traces to follow.
+- Network failures: communication between services can fail.
+- Debugging: an event may pass through several services before something goes wrong.
+- Resource consumption: each service needs resources to run.
+This is often called the distributed monolith problem when services are technically separate but remain heavily dependent on each other.
+
+We want independent services, not unnecessary fragmentation.
+
+15)Example: a badly designed microservices architecture
+Imagine we split NetGuard into these services:
+Collector
+    |
+    v
+Validation Service
+    |
+    v
+Normalization Service
+    |
+    v
+RTT Calculation Service
+    |
+    v
+ML Service
+    |
+    v
+Incident Service
+
+
+Suppose the ML service cannot work unless all the preceding services are available.
+
+If the RTT Calculation Service crashes, everything downstream stops receiving data.
+
+Now imagine we want to change the validation logic. We might need to coordinate deployments across several services because their interfaces and assumptions are tightly connected.
+
+We have introduced:
+- Multiple deployments.
+- Network communication.
+- More failure points.
+- More coordination.
+But we haven't gained much independence!
+Distributed monolith
+How should we avoid it?
+We should group responsibilities that naturally belong together.
+
+For example:
+Stream Processor
+    |
+    ├── Validate telemetry
+    ├── Normalize telemetry
+    └── Enrich telemetry
+
+
+These functions belong together because they form one coherent processing responsibility.
+
+We don't need three independently deployed services.
+
+However:
+Kafka
+  |
+  ├── Telemetry Persistence Worker
+  ├── ML Inference Worker
+  └── Statistics Worker
+
+
+These are good candidates for separate consumers because they have different responsibilities and can process events independently.
+
+16)Telemetry Collector
+Producer
+Publishes raw telemetry
+
+Kafka — telemetry.raw
+
+Stores the event
+
+Stream Processor
+Consumer + Producer
+Consumes raw telemetry, validates it, then publishes processed telemetry.
+
+Kafka — telemetry.processed
+
+Stores processed events
+
+Persistence Worker
+Consumer
+
+
+ML Worker
+Consumer
+
+17)An important distinction: an anomaly is not necessarily an incident.
+18)You don't simply turn TimescaleDB into ClickHouse.
+
+You would introduce ClickHouse as another storage system and migrate or replicate the relevant telemetry data into it. This adds synchronization, data consistency and operational complexity.
+
+A possible evolution:
+Initial architecture
+PostgreSQL + TimescaleDB extension
+
+Operational data + telemetry
+
+
+If analytical workload justifies it
+
+Possible future architecture
+PostgreSQL
+
+Networks, links, incidents, users
+
+
+ClickHouse
+
+Large-scale telemetry analytics
+
+19)Orchestration means managing how application containers run: starting them, restarting failed instances, scaling them, managing networking, and coordinating deployments.
+
+20)1. Scaling: Docker vs Kubernetes
+One small correction: Docker and Kubernetes aren't equivalent here.
+- Docker provides the container runtime: it runs containers.
+- Docker Compose lets you define and run multiple containers, and supports manually scaling certain services.
+- Kubernetes provides orchestration: it can automatically scale workloads based on configured metrics, restart failed containers, and manage their desired state.
+For example, if your ML worker needs three instances instead of one, Kubernetes can manage that independently of your API and collector.
+
+21)One important architectural lesson: health checks don't magically fix every failure. For example, if Kafka is temporarily unavailable, we shouldn't necessarily restart the entire Stream Processor repeatedly. We need to distinguish between an application that is dead and one that is temporarily unable to reach a dependency.
+
+That distinction will matter when we design NetGuard's resilience.
+
+22)1. Stopped vs. unhealthy container
+First, a container is an isolated environment in which your application process runs.
+
+There are two different situations:
+
+Situation A — The container stops
+
+Imagine your FastAPI application crashes because of an unhandled exception.
+- The main application process exits.
+- The container stops.
+- Docker detects that it stopped.
+- With restart: unless-stopped, Docker restarts it.
+Situation B — The container is unhealthy
+
+Imagine your FastAPI application is still running, but it gets stuck:
+- The process hasn't exited.
+- The container is still running.
+- However, its /health endpoint no longer responds successfully.
+- Docker marks the container as unhealthy.
+With Docker Compose's normal restart policy, this unhealthy status alone does not trigger a restart.
+
+23)2. What's a probe?
+A probe is a check Kubernetes periodically performs to determine the state of an application running inside a container.
+
+1. Startup probe
+Has it started?
+Kubernetes asks: "Has the application finished initializing?"
+
+Useful when an application takes 30 seconds to start. Kubernetes won't prematurely consider it unhealthy while it is still initializing.
+
+
+2. Liveness probe
+Is it still alive?
+Kubernetes asks: "Is the application functioning, or is it stuck?"
+
+If it fails repeatedly, Kubernetes restarts the container.
+
+
+3. Readiness probe
+Can it receive traffic?
+Kubernetes asks: "Is this application ready to handle requests?"
+
+If it fails, Kubernetes stops routing traffic to that Pod, but doesn't necessarily restart it.
+
+24)In normal circumstances, yes, if the application is functioning correctly inside the container, the container is necessarily running.
+25)Remember: Container state tells us whether the container is running; health checks tell us whether the application is functioning as expected.
+26)Can the container be marked unhealthy while the application inside it is actually healthy?
+
+Yes, absolutely!
+
+For example:
+- Your application works perfectly and responds to normal API requests.
+- But your Docker health check runs curl http://localhost:8000/health.
+- You accidentally configured the wrong port, or the health endpoint returns an unexpected status code.
+- Docker marks the container unhealthy, even though the application itself is functioning.
+So remember:
+
+Unhealthy means the configured health check failed. It doesn't necessarily mean the application is actually broken.
+
+Health checks are only as reliable as the checks we define.
+
+27)Without GitOps
+Imagine Jenkins builds a new version of your ML service.
+1. Jenkins builds and tests the image.
+2. Jenkins pushes it to GHCR.
+3. Jenkins connects to Kubernetes.
+4. Jenkins executes deployment commands to update the ML service.
+Jenkins is directly responsible for changing the cluster.
+With GitOps
+1. Jenkins builds and tests the image.
+2. Jenkins pushes it to GHCR.
+3. Jenkins updates the Kubernetes deployment configuration in Git with the new image version.
+4. Argo CD detects the Git change.
+5. Argo CD synchronizes Kubernetes with the desired configuration.
+The important difference
+Traditional CD
+
+CI/CD tool actively deploys to Kubernetes.
+
+
+GitOps
+
+Argo CD continuously compares Git's desired state with the actual cluster state.
+
+
+
+
+Why is this useful?
+Imagine someone manually changes the number of ML service replicas from 3 to 1 inside Kubernetes.
+
+But Git still declares that the desired number is 3.
+
+Argo CD detects the difference. With automated self-healing enabled, it can restore the cluster to the declared state.
+
+This is called drift detection and reconciliation.
+
+28)CI and CD have different responsibilities:
+CI	CD with GitOps
+Build application	Manage deployment configuration
+Run unit/integration tests	Synchronize Kubernetes
+Scan dependencies and images	Detect configuration drift
+Publish image to GHCR	Apply desired state
+Validate code changes	Monitor deployment synchronization
+
+Separating them gives us:
+- Independent pipelines.
+- Different permissions: CI needs permission to publish images and update deployment configuration; Argo CD needs permission to manage the cluster.
+- Better isolation: Jenkins doesn't need direct Kubernetes deployment credentials.
+- Independent failure handling.
+
+29)First, let's distinguish two objectives:
+- Anomaly detection: Identify unusual network behavior happening now or in recently collected telemetry.
+- Prediction: Estimate what might happen in the future, such as predicting network degradation before it occurs.
+For the initial version, I suggest we focus on anomaly detection. Prediction can be a later extension.
+
+30)1. False positive — yes, exactly!
+A false positive (FP) occurs when the model predicts an anomaly, but the observation is actually normal.
+
+Let's distinguish the four possible outcomes:
+Actual situation	Model says normal	Model says anomaly
+Normal	True Negative (TN)	False Positive (FP)
+Anomaly	False Negative (FN)	True Positive (TP)
+
+Two particularly important errors for NetGuard:
+- False positive: We raise an unnecessary alert. Too many false positives can cause alert fatigue.
+- False negative: We miss a real anomaly. This could be more dangerous because an actual network problem goes undetected.
+
+31)One nuance: thresholds should be configurable according to the network or link. A threshold that makes sense for one environment might not make sense for another.
+
+32)Synthetic data can be labeled, and historical data can remain unlabeled. Combining them doesn't automatically make the entire dataset unlabeled.
+
+For example:
+Data source	RTT	Packet loss	Label
+Historical	20 ms	0.1%	Unknown
+Historical	25 ms	0.2%	Unknown
+Synthetic	350 ms	15%	Anomaly
+Synthetic	22 ms	0.1%	Normal
+Synthetic	180 ms	8%	Anomaly
+
+We now have a partially labeled dataset.
+
+33)One important distinction: an anomaly is not automatically an incident. The detection system identifies suspicious behavior; a later stage can validate, group, prioritize, and turn detections into incidents.
+
+34)Telemetry sources
+Historical
+Dataset replay
+
+Synthetic
+Network simulator
+
+
+
+
+Telemetry Collector
+
+Reads or receives measurements and publishes events to Kafka
+
+
+Kafka — telemetry.raw
+
+
+Stream Processor
+
+Validates, normalizes and enriches telemetry
+
+
+Kafka — telemetry.processed
+
+
+Independent consumers
+Persistence Worker
+
+Stores telemetry in PostgreSQL/TimescaleDB
+
+ML Inference Worker
+
+Loads model and predicts anomalies
+
+
+
+
+Kafka — anomalies.detected
+
+Detected anomalies are published for incident processing
+
+35)1. What does the ML worker actually receive?
+The ML worker receives telemetry events from Kafka. But that does not mean it should receive the same observations used to train the model.
+
+Let's use your example of 10,000 historical observations.
+Offline ML workflow
+10,000 historical observations
+
+7,000
+
+Training
+
+Model learns
+
+
+3,000
+
+Testing
+
+Evaluate model
+
+
+
+
+After evaluation
+Approved model version 1
+
+Registered in MLflow
+
+
+Production inference workflow
+New incoming telemetry
+
+Historical replay of unseen observations or synthetic/live telemetry
+
+Kafka → ML worker
+
+Loads approved model v1 and predicts
+
+Prediction
+
+Normal or anomalous
+
+
+So, to answer your question directly:
+- The 7,000 training observations are used to build the model.
+- The 3,000 testing observations are used to evaluate it.
+- The inference worker should process new observations that were not used to train or evaluate that model when we want a genuine production-like evaluation.
+We can replay the remaining observations through Kafka to simulate incoming telemetry.
+
+And in the future, new telemetry can come from our simulator or an actual network collector.
+
+Important: historical replay is a way to simulate real-time ingestion; it doesn't mean that every historical observation is automatically suitable for production evaluation.
+
+After training and evaluating the model, we can replay those same 3,000 testing observations through our Kafka pipeline.
+
+But there's an important distinction: this replay is useful for testing the complete pipeline and observing inference behavior. It is not an independent evaluation of model quality anymore, because we already used those 3,000 observations to evaluate the model.
+
+For a genuine production-like evaluation, we should ideally use another unseen dataset or a later time period that wasn't used during model selection.
+
+Also, the historical replay is not the only source of telemetry. Our synthetic simulator can generate new observations, and eventually a real network collector can receive live measurements.
+36)2. Does approving version 2 mean the worker switches from v1 to v2?
+Exactly.
+
+But we need to distinguish between registering a model and approving a model for production.
+
+Imagine MLflow contains:
+Model version	Status
+v1	Production
+v2	Candidate
+v3	Experimental
+
+If v2 passes our evaluation and gets approved:
+1. v2 becomes the approved production version.
+2. The ML worker detects the new approved version.
+3. It downloads and loads v2 into memory.
+4. It switches from v1 to v2.
+5. v1 remains available for rollback.
+
+37)And no, we shouldn't automatically approve every version that performs better.
+
+For example, v2 might detect more anomalies but generate significantly more false alarms. We need acceptance criteria before promoting it.
+
+38)Before implementation: a short readiness checklist
+We've already made the major decisions in ADR-001 to ADR-007. Now we should verify that they're actionable.
+Item	What we need
+Requirements	Confirm functional and non-functional requirements are clear and measurable.
+Architecture diagram	Show services, databases, Kafka topics and communication paths.
+Deployment diagram	Show how services will run inside Kubernetes.
+Event contracts	Define the structure of telemetry events exchanged through Kafka.
+Service responsibilities	Clearly define what each service owns and what it does.
+
+39)One important architectural principle
+We should avoid designing NetGuard around the columns of one particular dataset.
+
+Instead:
+- NetGuard defines its own canonical telemetry schema.
+- Each data source adapts its format to that schema.
+- The downstream services don't need to know whether an event came from Zenodo, our simulator or eventually a real network.
+This gives us flexibility to change datasets without redesigning the whole platform.
+
+40)A vs B: What are we actually choosing?
+
+A. Pull — Collector requests measurements
+
+The collector periodically asks devices for their measurements.
+- Centralized control over collection frequency.
+- Works with devices exposing polling interfaces (e.g. SNMP).
+- Measurements may be delayed until the next polling interval.
+- Many requests can create overhead.
+
+
+B. Push — Devices send measurements
+
+Devices or agents send measurements whenever they collect them or when configured to do so.
+- Can provide lower-latency telemetry.
+- Avoids repeatedly polling every device.
+- Depends on device capabilities and configuration.
+- Can produce bursts of incoming events.
+
+41)Good clarification! And your questions are exactly the kind we should be asking during system design. You're not expected to know all the answers yet; we'll build the reasoning together.
+
+First, let's settle an important distinction:
+
+NetGuard will have one logical telemetry ingestion entry point: the Telemetry Collector.
+
+That doesn't mean only one physical source. The collector can communicate with many network links, simulators and cloud platforms, but the rest of NetGuard doesn't need to manage those sources individually.
+
+Your choice of a hybrid pull/push architecture is also reasonable. We can design for both without necessarily implementing both immediately.
+1. What happens when a link becomes unreachable?
+Your proposal is mostly correct:
+- The collector detects that the link isn't responding.
+- It records a collection failure.
+- It can generate a source-health event or alert.
+- It does not invent a telemetry measurement or insert an empty measurement row.
+
+For example, a link could stop responding because:
+- The network link is down.
+- The device is temporarily unreachable.
+- The collector itself has a connectivity problem.
+We shouldn't automatically classify all three as the same failure.
+
+Eventually, we should distinguish telemetry anomaly from source unavailable.
+
+42)Why not let the processor handle all the different source formats?
+
+Because then the processor needs to understand SNMP, webhook formats, simulator formats, and every new source we introduce.
+
+That creates unnecessary coupling.
+
+Think of the Collector as an anti-corruption layer: it protects the internal architecture from differences in external systems.
+
+43)What about multiple threads?
+Yes, we need concurrency, but let's not jump directly to threads.
+
+Imagine the collector polls 100 links. If it waits for link 1 to respond before polling link 2, a slow link could delay all the others.
+
+We could use:
+- Multiple threads.
+- Asynchronous I/O.
+- A bounded worker pool.
+The right choice depends on the protocols and libraries we use. We'll decide during implementation.
+
+Also, concurrency alone doesn't solve bursts: we need to consider buffering and Kafka producer throughput.
+
+44)For missing jitter, your answer is correct: represent it as unavailable, not zero.
+
+Why?
+- jitter = 0 means jitter was measured and found to be zero.
+- jitter = null means no measurement was available.
+Those are semantically different.
+
+45)An internal queue does not have to be Kafka.
+
+It can simply be a bounded in-memory queue inside the collector.
+Devices push telemetry
+
+Collector HTTP endpoints
+
+Receive and validate incoming requests
+
+Bounded internal queue
+
+Temporary buffer in collector memory
+
+Kafka producer
+
+Kafka — telemetry.raw
+
+
+The queue helps absorb short bursts when requests arrive faster than the collector can publish them.
+
+However, it has a limitation: it is volatile memory. If the collector crashes, queued but unpublished events can be lost.
+
+46)My recommendation for NetGuard
+For our initial architecture:
+- Bounded in-memory queue in the collector.
+- Asynchronous processing and controlled concurrency.
+- Kafka producer publishes events to telemetry.raw.
+- Retry/backpressure policy for incoming sources.
+- Explicit acknowledgement only after successful Kafka publication, where the source protocol permits it.
+Later, if we need stronger protection before Kafka publication, we can consider a durable local spool (for example, a disk-backed queue).
+
+I would not introduce a second Kafka cluster or broker between devices and the collector. That adds infrastructure without solving a clearly identified problem.
+
+47)These could be two legitimate measurements taken at the same timestamp, perhaps by different monitoring agents.
+
+If we use only (link_id, timestamp), we might accidentally discard B.
+
+A better approach:
+- Each measurement has an event_id.
+- A source that retries an event should reuse its original event_id.
+- The collector preserves that ID when available, or generates one for sources that don't provide one.
+- Downstream processing uses the ID to recognize duplicates.
+This is particularly important with Kafka's at-least-once delivery.
+
+48)4. Where should duplicate detection happen?
+I agree with your intuition that detecting duplicates early can save resources.
+
+But consider two different objectives:
+- Optimization: avoid sending unnecessary duplicates downstream.
+- Correctness: guarantee that duplicate delivery doesn't produce duplicate database records or incidents.
+The collector can perform some early duplicate filtering, but it shouldn't be our only protection.
+
+For example, the collector might crash after publishing an event to Kafka but before recording that publication. After restarting, it might publish the same event again.
+
+Therefore, downstream consumers must also tolerate duplicates.
+
+The persistence worker could enforce uniqueness using event_id in PostgreSQL.
+
+49)5. Should we average measurements from different providers?
+Not automatically.
+
+Suppose:
+- Provider A measures RTT = 100 ms.
+- Provider B measures RTT = 200 ms.
+The average is 150 ms, but what does that number represent?
+
+It might represent neither provider's actual network experience.
+
+They could be measuring from different locations, using different protocols, or observing different paths.
+
+I'd initially preserve both observations, including their provenance:
+- source_id
+- link_id
+- event_id
+- timestamp
+- rtt_ms
+If we later want aggregation, we can define explicit rules for it.
+
+50)You're asking the right questions. There are three important concepts to separate here: buffering, durability, and duplicate protection. They are related, but they aren't interchangeable.
+1. Why not put Kafka between devices and the collector?
+You're right about one thing: Kafka's internal buffering is much more sophisticated than a simple in-memory queue.
+
+But performance isn't the main reason I wouldn't put it there.
+
+Consider the two architectures:
+Architecture A — Direct ingestion
+Devices
+Collector
+Kafka
+
+
+Architecture B — External Kafka
+Devices
+Kafka
+Collector
+
+
+The problem with B is that every external device must know how to communicate with Kafka.
+- Does it support Kafka's protocol?
+- Can it authenticate to Kafka?
+- Can it serialize events in the expected format?
+- Can we configure its retry and delivery behavior?
+Many network devices support SNMP or specific streaming protocols, not Kafka.
+
+We would need adapters or gateways anyway.
+
+The important insight: Kafka is excellent for distributing events inside our platform, but it isn't necessarily the right protocol for every external telemetry source.
+
+And yes, Kafka's producer batching, buffering and network handling are generally more sophisticated than our small internal queue. But the queue has a different purpose: temporarily decoupling HTTP request handling from Kafka publication.
+
+We could eventually optimize the collector's queue without introducing another broker.
+
+51)3. Duplicate detection at every stage: is that excessive?
+Your concern is valid. We don't want every service implementing its own expensive deduplication database.
+
+The key principle is:
+
+Every component doesn't need to independently store and deduplicate every event. We need idempotency wherever duplicate processing could cause an incorrect side effect.
+
+Let's examine each stage:
+- Collector: can filter obvious duplicates, but shouldn't be our only guarantee. Keeping a permanent record of every received event here could be expensive.
+- Stream Processor: can avoid repeated work, but it also needs to handle Kafka redelivery. Its deduplication strategy depends on whether processing has side effects.
+- Persistence Worker: should enforce uniqueness in the database. This is a strong correctness boundary.
+- ML Worker: doesn't necessarily need a separate deduplication database just to run inference twice. But if duplicate predictions create duplicate anomaly events, we need protection at that boundary.
+- Incident Worker: must avoid creating multiple incidents for the same underlying anomaly.
+Notice the difference: running inference twice wastes CPU; creating two incidents for one anomaly can be a correctness problem.
+
+We can also use Kafka's idempotent producer to prevent certain duplicate writes caused by producer retries, but it doesn't replace application-level idempotency.
+
+So my recommendation is: propagate event_id throughout the pipeline, enforce uniqueness where persistent side effects occur, and add early filtering only when it is worth the complexity.
+
+52)Our intended flow is:
+Device sends E1
+Collector receives E1
+Collector publishes E1 to Kafka
+Kafka acknowledges publication
+Collector returns HTTP 200
+
+53)A disk-backed queue persists incoming events on disk instead of keeping them only in RAM.
+
+For example:
+1. Collector receives E1.
+2. Writes E1 to a local durable queue.
+3. Confirms the write is safely persisted.
+4. Returns HTTP 200.
+5. A background worker publishes E1 to Kafka.
+6. Once Kafka confirms publication, the local queued record can be marked as delivered and eventually removed.
+If the collector crashes after step 3, E1 remains on disk and can be published after restart.
+
+But this introduces additional responsibilities:
+- Disk capacity management.
+- Cleanup of successfully published events.
+- Recovery after crashes.
+- Disk I/O and performance.
+- Handling partially written records.
+C is therefore a stronger reliability mechanism, but also more complicated.
+
+For NetGuard, I would initially favor B, with retries supported by sources where possible. We can add a disk-backed spool if our reliability requirements justify it. We shouldn't promise zero data loss from an in-memory queue.
+
+B. Return HTTP 200 only after Kafka confirms successful publication.
+
+54)here's a subtle distinction between separation of responsibilities and separation of deployment units.
+Comparing the two approaches
+Option A — Two independent collectors
+Pull Collector
+
+Polls devices
+
+
+Push Collector
+
+Receives events
+
+
+
+Kafka
+
+Advantages:
+- Independent deployment and scaling.
+- Failure isolation.
+- Separate resource limits and queues.
+Disadvantages:
+- Duplicated code and configuration.
+- Two services to monitor and maintain.
+- Potentially duplicated normalization and publishing logic.
+  
+  Option B — One collector, two internal modules
+  Pull module
+  
+  Push module
+  
+  
+  Shared collector process
+  
+  Normalization, buffering and Kafka publishing
+  
+  Kafka
+  
+  Advantages:
+- Less operational complexity.
+- Shared processing logic.
+- Easier initial implementation.
+Disadvantages:
+- A process failure affects both ingestion modes.
+- Resource contention is possible.
+
+55)1. Replicas vs. separate collectors
+Suppose we have one collector application called telemetry-collector.
+A. Multiple replicas of the same collector
+Telemetry Collector Deployment
+
+Replica 1
+Running
+Same application
+
+
+Replica 2
+Running
+Same application
+
+
+
+Same image, configuration and responsibilities; independent processes and resources.
+
+Both replicas:
+- Run the same container image.
+- Have the same configuration (unless deliberately configured otherwise).
+- Execute the same application code.
+- Have independent memory, CPU and process lifecycles.
+- Can crash independently.
+For example, if replica 1 crashes, Kubernetes can restart it while replica 2 continues running.
+
+But there's a catch: if both replicas poll the same 100 devices, they might collect every measurement twice!
+
+We need a coordination strategy, such as assigning devices to replicas or using leader election.
+B. Two different collector services
+Pull Collector
+
+SNMP polling
+
+
+Push Collector
+
+HTTP ingestion
+
+
+
+Kafka
+
+These are different applications or independently deployed services.
+
+They can have:
+- Different code.
+- Different configurations.
+- Different resource requirements.
+- Different scaling policies.
+- Different release cycles.
+For instance, we could run 5 push collector replicas and 2 pull collector replicas.
+
+56)You chose:
+One codebase, but two independently deployed collector services sharing common libraries.
+
+This is a very reasonable architecture for NetGuard.
+
+We could organize it conceptually like this:
+telemetry-collection/
+├── shared/
+│   ├── event_schema/
+│   ├── normalization/
+│   ├── kafka_publisher/
+│   └── common_validation/
+│
+├── pull_collector/
+│   ├── polling/
+│   └── scheduling/
+│
+└── push_collector/
+    ├── http/
+    └── ingestion/
+
+
+The two collectors reuse common functionality without being coupled at runtime.
+57)	Active-active	Active-passive
+Traffic	All replicas serve traffic	Only active replica
+Resource usage	Higher utilization	Standby resources partly idle
+Failure	Other replicas continue	Standby must take over
+Complexity	Coordination may be needed	Leader election/failover needed
+Throughput	Can scale horizontally	Limited by active instance
+
+One subtlety: a Kubernetes Deployment with three replicas is normally active-active. Kubernetes doesn't automatically designate one as master and the others as backups.
+
+For active-passive behavior, we need additional coordination, such as leader election.
+58)3. Important correction about your previous answer
+You said replicas need synchronization to avoid publishing the same measurement twice.
+
+That's true for the pull collector, but not necessarily for the push collector.
+- Push replicas: a request is normally routed to one replica. They don't all receive and publish the same request.
+- Pull replicas: they might independently poll the same device, so we need coordination to avoid duplicate polling.
+This is a distinction worth remembering.
+
+59)The source_type field is useful for:
+- Observability: Compare push and pull event rates, errors and latency.
+- Data quality: Identify whether malformed events originate from a particular source.
+- Debugging: Trace an event back to its origin.
+- Analytics: Understand differences in sampling frequency and source behavior.
+
+60)How do events get assigned to partitions?
+A producer can specify a key.
+
+For example, if we publish events using link_id as the key:
+link-1 → Partition 0
+link-2 → Partition 1
+link-3 → Partition 2
+link-1 → Partition 0
+
+
+Events with the same key are normally routed to the same partition (assuming the partition count and partitioning strategy remain unchanged).
+
+2. How do consumers use partitions?
+Suppose our Stream Processor has one consumer group with three consumers:
+Consumer group: stream-processors
+Consumer 1
+P0
+
+
+Consumer 2
+P1
+
+
+Consumer 3
+P2
+
+
+
+Each partition is assigned to one consumer within this group at a time.
+This is the key relationship:
+- 3 partitions, 1 consumer → one consumer handles all three.
+- 3 partitions, 2 consumers → one handles two partitions, the other handles one.
+- 3 partitions, 3 consumers → each handles one.
+- 3 partitions, 5 consumers → only three can actively consume; two remain idle.
+So the maximum useful consumer parallelism in one consumer group is limited by the number of partitions.
+
+61)Topic: telemetry.raw
+
+Partition 0 ← Pull events
+Partition 1 ← Push events
+
+
+We could configure the producer to route events according to source_type.
+
+This gives us some isolation at the partition level, but there are trade-offs:
+- If push traffic becomes much larger, its partition can become the bottleneck.
+- Pull's partition may remain mostly idle.
+- We cannot easily increase push's parallelism without changing the partitioning strategy.
+An alternative is to have more partitions and distribute events by link_id, regardless of whether they came from push or pull.
+
+62)We scale to three consumers in the same group:
+Three consumers — same group
+Consumer 1
+P0
+
+
+Consumer 2
+P1
+
+
+Consumer 3
+P2
+
+
+
+
+Each consumer gets one partition. They process different portions of the topic in parallel.
+
+So yes: increasing from one to three consumers in the same group is a possible solution.
+
+You do NOT need three consumer groups, one per partition.
+
+Remember our earlier discussion about consumer groups:
+- Same group = consumers share the workload.
+- Different groups = each group independently receives all events.
+For example, Persistence Worker and ML Worker need different groups because both need to process the same events independently.
+
+63)4. What should we investigate before scaling?
+Not just push traffic. We need to identify the bottleneck.
+
+For example:
+- Is one partition receiving disproportionately more events?
+- Is the Stream Processor CPU-bound?
+- Is the processor slow because database writes are taking too long?
+- Is the processor consuming events quickly enough but failing to publish processed events to Kafka?
+If the processor is the bottleneck and partitions can be processed independently, scaling consumers is a good option.
+
+If PostgreSQL is the bottleneck, adding consumers might actually make things worse by increasing database pressure.
+
+And yes, Kubernetes HPA can automatically scale consumer pods. We can eventually use Kafka consumer lag as a scaling metric, rather than relying only on CPU.
+
+64)Lag means a delay between when something is produced and when it is processed.
+
+For Kafka, consumer lag measures how far behind a consumer group is from the latest events available in a partition.
+
+Imagine:
+- Kafka has received 10,000 events.
+- Your consumer has processed only 7,000.
+- Consumer lag = 3,000 events.
+
+65)1. Why can the same link be pushed and pulled?
+It doesn't have to be. I used that example to illustrate a possible situation, not a requirement for NetGuard.
+
+For instance, imagine a network link between Router A and Router B:
+- A monitoring agent on Router A periodically sends telemetry to NetGuard (push).
+- NetGuard also polls Router A using SNMP (pull).
+Both could report information about the same link.
+
+But they might report different metrics, use different sampling intervals, or even measure slightly different things.
+
+For our initial architecture, we don't need to assume that the same link is monitored by both methods. We can assign one collection method to each source/link and revisit overlapping observations if we encounter them.
+
+66)We can calculate chronological differences without Kafka delivering events in chronological order.
+
+So why did I recommend partitioning by link_id?
+
+Because not every operation needs to wait for a database query.
+
+Imagine a future Stream Processor maintaining a rolling average in memory for each link. It receives an event and immediately updates that link's state. If events arrive out of order, the state can become incorrect unless we implement event-time handling.
+
+67)One important distinction: real-time vs batch
+Processing mode	Behavior
+Streaming	Processes events continuously as they arrive
+Batch	Waits for a defined collection/window of data, then processes it
+
+NetGuard will initially use streaming for ingestion and persistence.
+
+We might still use batch processing for model training, historical analysis, or periodic reports.
+68)A. Validation
+Agreed. The collector validates source-specific input and normalizes it. The processor can perform deeper, source-independent validation.
+
+For example:
+- Is event_id present?
+- Is link_id valid?
+- Is the timestamp valid?
+- Are measurements within technically acceptable ranges?
+
+69)B. Enrichment
+I would distinguish two kinds of enrichment:
+- Source-specific enrichment: belongs in the Collector.
+- Platform-level enrichment: often belongs in the Stream Processor.
+
+70)Aggregation is different because it may require remembering previous events and managing time windows.
+
+For example, calculating the average RTT over the last 60 seconds requires state.
+
+We shouldn't automatically assume every aggregation belongs in the initial processor.
+
+71)E. Filtering
+Here, too, we need a distinction:
+- Malformed source payloads should be rejected by the Collector when possible.
+- Events that are structurally valid but fail platform-level validation should be handled by the Processor.
+- Valid events that are irrelevant to a particular downstream consumer shouldn't necessarily be discarded globally.
+
+72)1. Enrichment: where does the metadata come from?
+The Collector communicates with external devices, but it doesn't have to own all information about those devices.
+
+NetGuard can maintain its own metadata in PostgreSQL.
+
+For example, imagine we have this database information:
+
+Network metadata
+link_id	region	link_type	criticality
+link-17	Tunis	WAN	High
+link-18	Sfax	LAN	Medium
+
+The Collector receives:
+{
+  "link_id": "link-17",
+  "rtt_ms": 120,
+  "packet_loss": 0.02
+}
+
+
+The Stream Processor can retrieve the metadata associated with link-17 and enrich the event:
+{
+  "link_id": "link-17",
+  "rtt_ms": 120,
+  "packet_loss": 0.02,
+  "region": "Tunis",
+  "link_type": "WAN",
+  "criticality": "High"
+}
+
+
+Notice that this doesn't require contacting the external device. The metadata comes from NetGuard's own database.
+
+73)The Stream Processor shouldn't automatically decide that a measurement is anomalous just because its RTT is high. That's a separate detection responsibility.
+74)Stream Processor aggregation:
+
+Receives continuous events and calculates a rolling average over a time window, without waiting for a database query.
+
+Persistence aggregation:
+
+Stores individual observations and later calculates averages using SQL queries or database features.
+
+For NetGuard, I would initially prefer:
+- Stream Processor: validation, enrichment and event-level transformations.
+- Persistence Worker: store individual measurements.
+- Aggregations: initially performed through database queries when needed.
+We can introduce streaming aggregations later if a real-time use case justifies them.
+
+75)Neither the Persistence Worker nor the ML Inference Worker should be responsible for model training in our architecture.
+
+We have three distinct activities:
+Activity	Component	Responsibility
+Model training	ML Training Pipeline	Train candidate models using historical/training datasets
+Model evaluation	ML Evaluation Pipeline	Evaluate candidate models on held-out data
+Model inference	ML Worker	Use an approved model to make predictions on incoming telemetry
+
+76)Two consumer groups do not receive different partitions. They each receive the entire topic independently.
+
+Suppose telemetry.processed has three partitions:
+Kafka topic: telemetry.processed
+Partition 0
+
+Events A, B, C…
+
+
+Partition 1
+
+Events A, B, C…
+
+
+Partition 2
+
+Events A, B, C…
+
+
+
+
+Consumer group: persistence-group
+Receives all 3 partitions
+Its consumers share the workload across the partitions.
+
+Consumer group: ml-group
+Receives all 3 partitions
+Its consumers independently receive the same events.
+
+
+This is exactly why we chose separate consumer groups: both services need access to all telemetry, but process it independently.
+
+77)2. Training data versus inference data
+Consider this example:
+Dataset	Purpose
+January observations	Train model
+February observations	Evaluate model
+March observations	Live inference
+
+The model learns patterns from January. We evaluate its ability to generalize using February, which it hasn't seen before.
+
+Once the model is approved, the ML Worker uses it to predict anomalies in March.
+
+What if the ML Worker receives a January observation that was used for training?
+
+It can still make a prediction. It isn't technically forbidden. However, the prediction isn't a meaningful test of how well the model generalizes because the model has already learned from that observation.
+
+For that reason, we shouldn't use training observations to measure production model performance.
+
+78)Now, a challenge: Imagine we train a model on January data, approve it, and deploy it on February 1st. The ML Worker starts receiving February observations.
+
+Why is it important that February observations weren't accidentally included in the January training dataset?
+
+79)1. January — Model 1 training
+   - Persistence stores January observations.
+   - Training pipeline trains Model 1 using January data.
+   - Model 1 is evaluated and approved.
+   - ML Worker has no approved model yet, so it doesn't perform inference.
+2. February — Model 1 in production
+   - Persistence stores February observations.
+   - ML Worker uses Model 1 to predict anomalies in February.
+   - Meanwhile, February data becomes available for future training.
+3. March — Model 2 in production
+   - Training pipeline can use January + February observations to train Model 2.
+   - Model 2 is evaluated and approved.
+   - ML Worker switches from Model 1 to Model 2.
+
+Notice something important: Model 2 was trained on February observations, which Model 1 had already processed.
+
+That's perfectly acceptable.
+
+Period	ML Worker	Training pipeline
+January	No inference (no approved model)	Trains Model 1
+February	Model 1 predicts February observations	Trains Model 2 using January + February
+March	Model 2 predicts March observations	Can start preparing Model 3
+
+So yes, when Model 2 is approved on March 1st and activated, it predicts new March observations.
+
+However, Model 2 was trained using February observations that Model 1 had already processed. That's fine.
+
+80)You want temporal separation between training/evaluation data and live inference data:
+- Model 2 trains and evaluates on January + February.
+- Model 2 is approved on March 1st.
+- From March 1st onward, the ML Worker predicts on new March observations.
+- March observations must not have been included in Model 2's training or evaluation datasets.
+That's the right approach for our initial model lifecycle. It avoids temporal data leakage.
+
+81)A. Discard immediately
+Suppose the event references link_id = L42, but L42 doesn't exist in PostgreSQL.
+
+If we discard it:
+- We lose the event permanently.
+- We might never discover that L42 was accidentally omitted from our database.
+- We have no event to reprocess after fixing the configuration.
+C. Send it to a Dead Letter Queue (DLQ)
+We can introduce a Kafka topic:
+
+telemetry.dlq
+
+The processor sends invalid or unprocessable events there, together with useful error information.
+
+82)Error	Possible handling
+Missing required field	DLQ
+Unknown link ID	DLQ, investigate configuration
+Temporary PostgreSQL outage	Retry, not immediate DLQ
+Malformed JSON	DLQ
+
+A temporary database outage is different from an event that is permanently invalid. We shouldn't send every temporary failure straight to the DLQ.
+
+83)This is an important distributed-systems principle: one bad event should not block the processing of unrelated valid events.
+
+This is often called fault isolation.
+
+84)But let's refine it: a retry topic and a DLQ serve different purposes.
+- Retry topic: for events that failed because of a potentially temporary problem. They can be attempted again later.
+- DLQ: for events that cannot be processed normally, or that exhausted their retry attempts and need investigation.
+For example:
+telemetry.raw
+     |
+     v
+Stream Processor
+     |
+     ├── Success ─────────> telemetry.processed
+     |
+     └── Temporary failure
+                 |
+                 v
+           telemetry.retry
+                 |
+           Retry attempts
+                 |
+          ┌──────┴──────┐
+          v             v
+       Success       Exhausted
+          |             |
+          v             v
+ telemetry.processed  telemetry.dlq
+
+
+One important detail: retries should generally use exponential backoff (e.g. 1s, 2s, 4s, 8s), with a maximum retry count.
+
+We also need to avoid retrying permanent errors, such as malformed JSON, as they won't become valid just by waiting.
+
+85)The problem is that the processor cannot always know whether Kafka successfully received its previous publication.
+
+Consider this sequence:
+1. Processor publishes E2 to telemetry.retry.
+2. Kafka successfully stores E2.
+3. The acknowledgement gets lost because of a network failure.
+4. The processor assumes publication failed and retries.
+5. Kafka stores E2 again.
+Even if the processor has a stable event_id, it needs a way to detect or prevent that duplicate publication.
+
+And there is another possibility: the retry consumer itself can crash after performing its operation but before committing its offset. Kafka then delivers the same retry message again.
+
+That's why we need protection at the consumer that performs the side effect.
+The distinction
+Protection	What it protects against
+Stream Processor idempotency	Duplicate handling/publication from the original event
+Retry Consumer idempotency	Duplicate delivery and processing of retry messages
+
+Stable event_id is the foundation, but simply having an ID doesn't automatically prevent duplicates. A component must actually use it to enforce idempotency.
+
+86)End-to-end idempotency
+1. Stream Processor: stable event ID and safe retry handoff.
+2. Retry Consumer: tolerate duplicate retry deliveries.
+3. Persistence Worker: database uniqueness constraint.
+4. ML Worker: prevent duplicate anomaly/incident effects.
+
+One important correction: we don't need every service to maintain its own deduplication database. We enforce idempotency where duplicate processing could create harmful side effects.
+
+87)- Intentional retry: publishing the same event again because processing previously failed.
+- Accidental duplicate: publishing the same event twice because of a crash, lost acknowledgement, or redelivery.
+We want to allow the first while preventing harmful effects from the second.
+
+1. Example: intentional retry
+Suppose E2 has event_id = 123.
+telemetry.raw
+      |
+      v
+Stream Processor
+      |
+      | PostgreSQL unavailable
+      v
+telemetry.retry
+      |
+      | Wait 5 seconds
+      v
+Retry Consumer
+      |
+      | PostgreSQL available
+      v
+telemetry.processed
+
+
+Here, E2 is intentionally published to another topic. That's not a duplicate-processing error. It's a retry.
+
+88)2. Example: accidental duplicate
+Now imagine:
+1. Processor publishes E2 to telemetry.retry.
+2. Kafka stores it successfully.
+3. The acknowledgement is lost.
+4. Processor retries the publication.
+5. Kafka stores E2 again.
+Now telemetry.retry contains two messages with event_id = 123.
+
+This is where idempotency matters.
+3. Where does idempotency happen?
+There are two levels:
+Mechanism	Purpose
+Kafka idempotent producer	Prevents certain duplicate writes caused by producer retries within a producer session
+Application-level idempotency (event_id)	Prevents duplicate business effects even when the same event is delivered or published again
+
+For example, the Persistence Worker can execute an insert with a unique constraint on event_id. If it receives E2 twice, only one database record is created.
+
+Important: Kafka's idempotent producer does not automatically deduplicate messages across different topics or different producer sessions using your application-level event ID.
+
+89)deduplication must be scoped to the operation, not applied globally to an event ID.
+
+Suppose E2 is intentionally sent to telemetry.retry three times because three processing attempts failed.
+
+Eventually, one attempt succeeds and E2 is published to telemetry.processed.
+
+Should we reject E2 just because its event_id has already appeared in telemetry.retry?
+
+Or should we allow it to reach telemetry.processed?
+
+(no rejection, 2 diff topics)
+
+90)1. The problem producer idempotency solves
+Imagine the Stream Processor wants to publish event E2 to telemetry.retry.
+Without idempotent producer
+1. Producer sends E2
+   
+   Kafka receives and stores E2 successfully.
+2. Kafka sends acknowledgement
+   
+   But the network drops the acknowledgement.
+3. Producer assumes failure
+   
+   It retries sending E2.
+4. Kafka stores E2 again
+   Two copies
+
+The problem is that the producer doesn't know whether the first request succeeded.
+2. With Kafka producer idempotency
+Kafka provides an idempotent producer mechanism.
+
+When enabled, Kafka assigns the producer an identity and uses sequence numbers for messages sent to each partition.
+
+Conceptually:
+Producer identity: P1
+
+Send E2 → sequence 10
+Retry E2 → sequence 10 again
+
+
+Kafka recognizes that the second transmission is a retry of the same producer message and avoids appending it twice.
+One stored copy
+This mechanism is useful for network retries and lost acknowledgements.
+3. But producer idempotency has limits
+It doesn't mean Kafka understands your business-level event_id.
+
+For example:
+- The application independently publishes E2 again as a new send.
+- A different producer publishes E2.
+- A consumer republishes E2 after a retry.
+These can still create duplicates.
+
+That's why we also retain application-level idempotency using event_id.
+
+91)2. ML Worker
+Your reasoning is also correct for independent inference.
+
+If the ML model predicts whether each observation is anomalous independently, it doesn't need to receive observations in chronological order.
+
+However, if we later introduce models that depend on a sequence of observations (for example, detecting a gradual increase in latency), ordering or event-time windowing becomes important.
+
+For now, we can avoid that complexity.
+
+92)- Prediction: the ML Worker evaluates an observation and produces a result, such as normal, anomaly, or an anomaly score.
+- Incident: a confirmed or actionable problem created from one or more anomaly detections.
+Our current architecture is:
+telemetry.processed
+        |
+        v
+    ML Worker
+        |
+        v
+anomalies.detected
+        |
+        v
+  Incident Worker
+        |
+        v
+    PostgreSQL
+
+
+For the initial design, we agreed that the ML Worker publishes detected anomalies to anomalies.detected. The Incident Worker creates and persists incidents.
+
+We haven't decided whether to store every prediction, including normal predictions, or only anomaly results. That's a separate design decision we can make later when defining monitoring, audit and historical analysis requirements.
+
+93)1. What are we trying to achieve with NetGuard?
+We have two related but distinct objectives:
+
+A. Network visibility and historical analysis
+- Visualize network health over time.
+- Identify abnormal periods.
+- Investigate past incidents.
+- Understand how latency, jitter and packet loss evolve.
+- Compare different links and regions.
+B. Operational anomaly detection
+- Detect abnormal network behavior as it happens.
+- Generate alerts and incidents.
+- Allow operators to investigate and intervene quickly.
+These objectives can coexist.
+
+And here's an important distinction: a measurement can be too old to trigger an immediate intervention, but still be extremely valuable for historical analysis.
+
+94)I would avoid discarding valid telemetry just because it's late.
+
+Instead, distinguish two timestamps:
+Timestamp	Meaning
+event_timestamp	When the device measured the observation
+ingestion_timestamp	When NetGuard received it
+
+This lets us understand both the actual network timeline and collection delays.
+
+Later, we can introduce policies for:
+- Historical storage: retain valid late observations.
+- Anomaly detection: analyze them, but distinguish historical anomalies from current ones.
+- Alerting: avoid triggering misleading real-time alerts for old observations.
+
+One nuance: a late anomaly could still be worth notifying an operator about as a historical finding, but that's a separate notification policy.
+
+95)Yes! What you're describing is a well-known pattern: Change Data Capture (CDC).
+
+Instead of publishing metadata changes through Kafka manually, NetGuard can detect changes made directly in PostgreSQL and propagate only those changes to the processor's in-memory cache.
+How CDC works
+PostgreSQL
+
+A link's metadata is updated
+
+L42: criticality = High → Low
+
+Change captured from PostgreSQL's transaction log (WAL)
+
+CDC mechanism
+
+Detects the change and forwards it
+
+
+Stream Processor
+
+Updates its local cache
+
+L42: criticality = Low
+
+
+PostgreSQL's Write-Ahead Log (WAL) records database changes. CDC tools can read those changes and deliver them to other systems.
+
+One popular example is Debezium. It can capture PostgreSQL changes and publish them to Kafka, but CDC itself is not Kafka-specific: other delivery mechanisms and implementations exist.
+
+96)But there's an important architectural question
+What happens when a Stream Processor replica restarts?
+
+Its in-memory cache is empty. It needs a way to reconstruct the current metadata before processing events.
+
+A common solution is:
+1. Load an initial snapshot of metadata from PostgreSQL.
+2. Start consuming changes from the correct point in the change stream.
+3. Apply subsequent changes to the cache.
+There is a subtle consistency problem here: we must avoid missing changes that occur while the initial snapshot is being loaded.
+
+97)1. First, what is the change stream?
+PostgreSQL has a Write-Ahead Log (WAL). It records database changes in sequence.
+
+Imagine these operations:
+WAL position	Operation
+100	L42 criticality = High
+101	L43 criticality = Medium
+102	L42 criticality = Low
+103	L44 criticality = High
+
+A CDC tool reads the WAL and exposes changes to consumers.
+
+Think of it as a log with positions, not a queue where a message disappears as soon as one consumer reads it.
+
+Important: A replica reading position 102 does not delete position 102. Other replicas can read it too.
+
+This is exactly why your choice B (all replicas independently consume the changes) makes sense.
+
+98)2. The actual problem: snapshot and change-stream synchronization
+Let's use a concrete example.
+
+Suppose PostgreSQL initially contains:
+L42 → criticality = High
+L43 → criticality = Medium
+
+
+A new replica starts at 12:00.
+
+A naive startup implementation does this:
+1. 12:00:00 — Snapshot begins
+   
+   It reads L42 = High and L43 = Medium.
+2. 12:00:01 — Database update
+   
+   An administrator changes L42 to Low. PostgreSQL records this in its WAL.
+3. 12:00:02 — Replica starts consuming
+   
+   It starts reading from the current end of the change stream, rather than from the position corresponding to the beginning of its snapshot.
+The replica now has:
+L42 → High     ❌ stale
+L43 → Medium
+
+
+It missed the update because it started reading from the wrong position.
+
+Notice something important: the change was not deleted when it happened. The replica simply didn't ask to read that earlier position.
+
+If it had started reading from the correct earlier position, as you suggested, it would have received the update.
+
+99)3. How robust CDC solves this
+A robust CDC snapshot coordinates two things:
+- The state of PostgreSQL at a specific WAL position.
+- The position from which subsequent changes must be consumed.
+Let's say the CDC mechanism establishes position 100.
+Timeline of a coordinated snapshot
+1. Establish snapshot position: WAL 100
+   
+   The CDC mechanism identifies a consistent database state corresponding to position 100.
+2. Read initial snapshot
+   
+   The replica obtains L42 = High and L43 = Medium, representing the state at position 100.
+3. Changes happen during snapshot
+   
+   PostgreSQL records:
+   - WAL 101: L42 becomes Low.
+   - WAL 102: L43 becomes High.
+   The CDC mechanism retains these changes for subsequent delivery.
+4. Finish snapshot and replay changes
+   
+   The replica applies changes after position 100, in order.
+   - L42 becomes Low.
+   - L43 becomes High.
+5. Cache becomes ready
+   
+   The replica now has the current metadata and continues consuming new changes.
+
+Consistent cache
+L42 → Low
+L43 → High
+
+
+
+This is the fundamental idea behind snapshot coordination in tools such as Debezium.
+
+100)But there is a limitation: CDC changes cannot necessarily be retained forever.
+
+For example, if the replica remains offline for a very long time, the required WAL data might become unavailable, depending on the CDC retention configuration. PostgreSQL replication slots can retain the required WAL, but this consumes disk space.
+
+If the required position is no longer available, the replica needs to reload a fresh snapshot.
+
+101)1. Why would a replica start at the current end instead of the beginning?
+It shouldn't necessarily do that. I used it as an example of a badly configured startup procedure.
+
+There are actually three different starting strategies:
+Starting position	What happens
+Beginning of available log	Replays all retained changes.
+Current end of log	Receives only future changes.
+Specific WAL position	Receives changes from a chosen point onward.
+
+
+
+The important insight:
+
+We don't need the entire history of a metadata field. We need:
+- A snapshot representing its state at a particular moment.
+- Every change that occurred after that moment.
+That gives us the correct state without replaying unnecessary history.
+
+102)Could we optimize this by keeping only the latest update per link?
+
+Potentially, yes. But that's an optimization, not something we need initially. Replaying the ordered changes is simpler and preserves any intermediate changes that might matter to other consumers.
+
+103)3. How do we choose the snapshot position?
+This is the central mechanism of robust CDC.
+
+We don't manually guess a WAL position.
+
+The CDC connector coordinates the snapshot and the WAL position.
+
+Let's use Debezium with PostgreSQL as an example.
+
+PostgreSQL uses an identifier called an LSN (Log Sequence Number) to identify positions in its WAL.
+
+Imagine Debezium performs these operations:
+Coordinated snapshot example
+1. Capture a consistent position
+   
+   Debezium establishes a consistent snapshot associated with LSN 500.
+2. Read the database snapshot
+   
+   It reads the metadata as it existed at that consistent point.
+   L42 = High
+   L43 = Medium
+3. Capture concurrent changes
+   
+   While the snapshot is being read, PostgreSQL records:
+   LSN 501: L42 = Low
+   LSN 502: L43 = High
+4. Finish snapshot and process subsequent changes
+   
+   Debezium starts streaming changes from the coordinated WAL position, ensuring changes made after the snapshot are not lost.
+
+104)If Replica 2 receives the same update twice:
+First delivery:  L42 = Medium
+Second delivery: L42 = Medium
+
+
+The final cache state remains L42 = Medium.
+
+This is an idempotent operation: applying it multiple times produces the same final result as applying it once.
+
+You're also right about the redundant operation. We perform an unnecessary cache write, but we don't corrupt the data.
+Two separate concerns
+- Data consistency: The cache remains correct.
+- Efficiency: We perform an unnecessary operation.
+We can accept this initially rather than introduce complicated deduplication mechanisms.
+One important distinction
+What if the update were an operation rather than an assignment?
+
+For example:
+L42 packet_count = packet_count + 100
+
+
+Applying it twice would increase the count by 200 instead of 100.
+
+105)If we chose Option B, we could introduce a separate topic, for example telemetry.pending_enrichment.
+telemetry.raw
+      |
+Stream Processor
+      |
+      ├── Metadata available
+      |       └── telemetry.processed
+      |
+      └── Metadata unavailable
+              └── telemetry.pending_enrichment
+
+
+A separate worker or recovery mechanism could enrich those pending events later.
+
+That would avoid downstream consumers receiving incomplete events as if they were fully processed. However, it introduces another lifecycle to manage.
+
+106)Situation 1: A replica is starting for the first time.
+
+It has no metadata cache. It cannot safely enrich events until it loads a consistent snapshot and synchronizes CDC. Waiting for PostgreSQL is reasonable.
+
+Situation 2: A replica is already running when PostgreSQL becomes unavailable.
+
+It already has a populated cache.
+
+It could continue processing with its last known metadata, while recording that its cache may be stale.
+
+For example:
+L42:
+  Cached criticality: High
+  Metadata version: 10
+  Latest known version: 10
+  Cache freshness: Potentially stale
+
+
+When PostgreSQL and CDC become available again, it consumes the missing updates and refreshes its cache.
+
+This is a trade-off:
+- Continue processing: better availability, but potentially stale enrichment.
+- Pause processing: stronger consistency, but growing Kafka lag.
+
+107)Consider whether an outdated criticality or region value could lead NetGuard to make an incorrect decision.
+
+108)Metadata can be useful without being required for ML inference.
+
+For example:
+Metadata	Possible use
+Region	Dashboard filtering, regional statistics
+Link type (fiber/wireless)	Contextual analysis, different baselines
+Criticality	Incident severity and prioritization
+Network ID	Grouping links and displaying network health
+
+Does ML need this metadata?
+It depends on the model.
+
+For our initial approach, suppose Isolation Forest uses only measurement features:
+RTT
+Jitter
+Packet loss
+Throughput
+
+
+Then it doesn't need region, link type or criticality to produce its prediction.
+
+But a future model might use link type because normal RTT distributions can differ between fiber and wireless links.
+
+So we shouldn't assume metadata will never matter to ML. We should make it an optional feature dependency.
+One important architectural distinction
+I suggest we separate:
+1. Required metadata: Needed to process an event correctly, such as validating that link_id exists.
+2. Enrichment metadata: Additional context such as region, criticality and link type.
+If enrichment metadata is stale, the processor can continue and mark its freshness.
+
+If required metadata cannot be validated, the event may need to be held or routed for later investigation.
+
+This prevents an outage in PostgreSQL from automatically stopping all telemetry processing.
+
+109)We can keep the distinction:
+- Enriched: Metadata is available and synchronized.
+- Enriched with stale metadata: Metadata is available but may be outdated.
+- Pending enrichment: Required metadata is unavailable.
+
+110)Your proposed approach is possible, but we need to distinguish between updating telemetry and updating an existing incident.
+
+111))So we shouldn't automatically assume every metadata change requires rewriting historical telemetry.
